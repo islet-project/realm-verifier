@@ -1,9 +1,11 @@
 mod parser;
 
 pub mod hash;
+use std::collections::HashMap;
+
 pub use parser::json as parser_json;
 
-use log::{debug, error};
+use log::{debug, error, warn};
 use ratls::{InternalTokenVerifier, RaTlsError};
 use rust_rsi::{verify_token, RealmClaims, CLAIM_COUNT_REALM_EXTENSIBLE_MEASUREMENTS};
 use tinyvec::ArrayVec;
@@ -11,7 +13,7 @@ use hash::HashAlgo;
 
 pub const MAX_MEASUREMENT_SIZE: usize = 64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeasurementValue {
     value: ArrayVec<[u8; MAX_MEASUREMENT_SIZE]>,
 }
@@ -41,43 +43,48 @@ pub struct RealmMeasurements {
     pub hash_algo: HashAlgo,
 }
 
+type RealmID = Vec<u8>;
+
 #[derive(Debug)]
 pub struct RealmVerifier {
-    reference_measurements: RealmMeasurements,
-}
-
-fn eq_msg<T: PartialEq<U>, U>(lhs: T, rhs: U, msg: &str) -> bool {
-    match lhs == rhs {
-        true => {
-            debug!("{} match", msg);
-            true
-        }
-        false => {
-            error!("{} do not match", msg);
-            false
-        }
-    }
+    reference_measurements: HashMap<RealmID, RealmMeasurements>,
 }
 
 impl RealmVerifier {
-    pub fn init(reference_measurements: RealmMeasurements) -> Self {
-        debug!("Reference values: {:02x?}", reference_measurements);
+    pub fn init(realm_measurements: Vec<RealmMeasurements>) -> Self {
+        debug!("Reference values: {:02x?}", realm_measurements);
+        let input_len = realm_measurements.len();
+        let reference_measurements: HashMap<_, _> = realm_measurements
+            .into_iter()
+            .map(|m| (m.initial.as_slice().to_vec(), m))
+            .collect();
+
+        if reference_measurements.len() < input_len {
+            warn!("Multiple reference values for the same RIM found!");
+        }
         Self {
             reference_measurements,
         }
     }
 
-    fn check_rim(&self, rim: &[u8]) -> bool {
-        eq_msg(self.reference_measurements.initial.as_slice(), rim, "RIM")
-    }
+    fn check(&self, rim: &[u8], rems: &[Vec<u8>], hash_algo: &str) -> bool {
+        let Some(reference) = self.reference_measurements.get(&rim.to_vec()) else {
+            error!("No reference for RIM {:02x?}", rim);
+            return false;
+        };
 
-    fn check_rems(&self, rems: &[Vec<u8>]) -> bool {
         if rems.len() != CLAIM_COUNT_REALM_EXTENSIBLE_MEASUREMENTS {
             error!("Wrong count of REMs: is ({}), should be ({})",
                    rems.len(), CLAIM_COUNT_REALM_EXTENSIBLE_MEASUREMENTS);
             return false;
         }
-        for reference_rems in &self.reference_measurements.extensible {
+
+        if hash_algo != reference.hash_algo.name() {
+            error!("Hash algorithm does not match: is ({}), should be ({})",
+                   hash_algo, reference.hash_algo.name());
+        }
+
+        for reference_rems in &reference.extensible {
             let mut match_count = 0;
             for (i, rem) in rems.iter().enumerate() {
                 if reference_rems[i].as_slice() == rem {
@@ -91,11 +98,6 @@ impl RealmVerifier {
         }
         error!("Could not find matching reference REMs");
         return false;
-    }
-
-    fn check_hash_algo(&self, hash_algo: &str) -> bool {
-        eq_msg(self.reference_measurements.hash_algo.name(),
-               hash_algo, "Hash algorithm")
     }
 }
 
@@ -114,9 +116,7 @@ impl InternalTokenVerifier for RealmVerifier {
             debug!("token rem[{}]: {}", rem_idx, hex::encode(&rem));
         }
 
-        match self.check_rim(&claims.rim)
-            && self.check_rems(&claims.rems)
-            && self.check_hash_algo(&claims.hash_algo)
+        match self.check(&claims.rim, &claims.rems, &claims.hash_algo)
         {
             true => Ok(()),
             false => Err(RaTlsError::GenericTokenVerifierError(
@@ -128,26 +128,59 @@ impl InternalTokenVerifier for RealmVerifier {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::{BufReader, Read}};
+    use std::{fs::File, io::{BufReader, Read}, path::Path};
     use super::*;
 
-    #[test]
-    fn verify_token() {
+    fn load_token(path: impl AsRef<Path>) -> Vec<u8> {
         let mut token = Vec::<u8>::with_capacity(128);
-        File::open("tests/token.bin").unwrap().read_to_end(&mut token).unwrap();
+        File::open(path).unwrap().read_to_end(&mut token).unwrap();
         token.shrink_to_fit();
+        token
+    }
 
-        let file = File::open("tests/realm.json").unwrap();
+    fn load_reference_values(path: impl AsRef<Path>) -> RealmMeasurements {
+        let file = File::open(path).unwrap();
         let reader = BufReader::new(file);
 
         let reference_json: serde_json::Value = serde_json::from_reader(reader).unwrap();
         let reference_values_json = reference_json["realm"]["reference-values"].clone();
+        crate::parser_json::parse_value(reference_values_json).unwrap()
+    }
 
-        let reference_values = crate::parser_json::parse_value(reference_values_json).unwrap();
-        let verifier = RealmVerifier::init(reference_values);
+    #[test]
+    fn verify_token() {
+        let token = load_token("tests/token.bin");
+        let reference_values = load_reference_values("tests/realm.json");
 
+        let verifier = RealmVerifier::init(vec![reference_values]);
         let verification_result = verifier.verify(&token);
 
-        verification_result.unwrap();
+        assert!(verification_result.is_ok());
+    }
+
+    #[test]
+    fn no_matching_rim() {
+        let token = load_token("tests/token2.bin");
+        let reference_values = load_reference_values("tests/realm.json");
+
+        let verifier = RealmVerifier::init(vec![reference_values]);
+        let verification_result = verifier.verify(&token);
+
+        assert!(verification_result.is_err());
+    }
+
+    #[test]
+    fn verify_multiple() {
+        let token = load_token("tests/token.bin");
+        let reference_values = load_reference_values("tests/realm.json");
+
+        let token2 = load_token("tests/token2.bin");
+        let reference_values2 = load_reference_values("tests/realm2.json");
+
+        let verifier = RealmVerifier::init(vec![reference_values, reference_values2]);
+
+        assert!(verifier.verify(&token).is_ok());
+        assert!(verifier.verify(&token2).is_ok());
+
     }
 }
