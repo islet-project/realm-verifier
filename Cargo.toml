@@ -6,10 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hex = "*"
-log = "*"
+hex = "0.4"
+log = "0.4"
 serde = {version = "*", features = ["derive"]}
-serde_json = "*"
-tinyvec = "*"
+serde_json = "1.0"
+tinyvec = "1.0"
 rust-rsi = { git = "https://github.com/islet-project/rust-rsi" }
 ratls = { git = "https://github.com/islet-project/ratls" }
