@@ -1,0 +1,20 @@
+# cargo-audit configuration for the realm-verifier workspace.
+# NOTE: cargo-audit reads `.cargo/audit.toml` only from the directory it is
+# invoked in (and its parent directories). The identical ignore lists in the
+# ratls / veraison-verifier repositories do NOT apply here, even though rsa
+# arrives via the ratls dependency.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin): RSA PKCS#1 v1.5 decryption timing side-channel.
+    # Transitively required by `ratls`, which uses the `rsa` crate ONLY to
+    # generate ephemeral RSA-2048 keypairs and export public/PKCS#8 keys for
+    # self-signed RA-TLS certificates. realm-verifier itself performs no RSA
+    # operations at all (it validates RIM reference measurements), and no code
+    # path reachable from this crate decrypts RSA ciphertext. No fixed stable
+    # upgrade exists for `rsa` (0.9.10 is latest; fix only in the unreleased
+    # 0.10 line), matching the documented decisions in the ratls and
+    # veraison-verifier repositories. Re-evaluate if rsa 0.10+ ships stable or
+    # if ratls drops the crate (ECDSA cert keys).
+    "RUSTSEC-2023-0071",
+]
